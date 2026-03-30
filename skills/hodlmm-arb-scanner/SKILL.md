@@ -15,24 +15,34 @@ metadata:
 
 Detects price arbitrage opportunities between Bitflow **HODLMM (DLMM)** pools and traditional **XYK / StableSwap** pools. When a spread exceeding the configured threshold is found, the skill can execute the arbitrage swap automatically.
 
-## How It Works
+## What it does
 
-1. **Fetch HODLMM pools** from Bitflow's HODLMM API and derive the effective price from each pool's active bin.
-2. **Fetch XYK/StableSwap pools** for the same token pairs and derive the effective price from the reserves ratio.
-3. **Compare prices** between pool types for each overlapping pair.
-4. **Calculate spread** as a percentage and estimate gross/net profit accounting for fees.
-5. **Optionally execute** the arbitrage: buy on the cheaper pool, sell on the more expensive one, via Bitflow's swap routing API.
+Scans all Bitflow HODLMM concentrated-liquidity pools and compares their effective prices against XYK and StableSwap pools for the same token pairs. When a price discrepancy (spread) exceeds a configurable threshold (default 50 bps), it reports the opportunity with direction, estimated profit, and fee breakdown. Optionally executes the arbitrage trade via Bitflow's swap routing API.
+
+## Why agents need it
+
+Autonomous agents managing DeFi portfolios on Stacks need real-time visibility into cross-pool pricing inefficiencies. Without this skill, agents cannot detect when the same token pair is priced differently across HODLMM vs XYK vs StableSwap pools — leaving arbitrage profit on the table. This skill turns passive portfolio management into active alpha capture by providing structured, actionable spread data that agents can act on programmatically.
+
+## Safety notes
+
+- **Writes to chain**: Yes — the `execute` command submits swap transactions on Stacks mainnet.
+- **Moves funds**: Yes — arbitrage execution swaps tokens between pools using the agent's wallet.
+- **Mainnet only**: Yes — all pool data and execution targets are Stacks mainnet contracts.
+- **Irreversible**: Swap transactions are final once confirmed on-chain. There is no undo.
+- **Risk**: Price spreads may close between detection and execution. Gas fees, slippage, and pool fees reduce realized profit. Never enable auto-execute without setting a conservative `maxAmountSats` limit.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `doctor` | Verify Bitflow API connectivity, list available HODLMM pools and their status |
-| `scan` | Scan all HODLMM pools, compare against XYK pools, report arbitrage opportunities |
+| `scan` | Scan all HODLMM pools, compare against XYK/StableSwap pools, report arbitrage opportunities |
 | `execute --pool-id <id> --amount <sats>` | Execute an arb swap when spread exceeds threshold |
 | `history` | Show recently detected arbitrage opportunities (persisted locally) |
 
-## Scan Output
+## Output contract
+
+### Success (scan)
 
 ```json
 {
@@ -53,6 +63,11 @@ Detects price arbitrage opportunities between Bitflow **HODLMM (DLMM)** pools an
 }
 ```
 
-## Risk Disclaimer
+### Error
 
-Arbitrage execution involves real funds. Price spreads may close between detection and execution. Gas fees, slippage, and pool fees reduce realized profit. Always verify opportunities manually before enabling automated execution.
+```json
+{
+  "ok": false,
+  "error": "HODLMM API unreachable after 3 retries"
+}
+```

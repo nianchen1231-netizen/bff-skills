@@ -1,4 +1,4 @@
-#!/usr/bin/env ts-node
+#!/usr/bin/env bun
 
 /**
  * HODLMM Arb Scanner
