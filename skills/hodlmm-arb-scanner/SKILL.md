@@ -3,7 +3,7 @@ name: hodlmm-arb-scanner
 description: "HODLMM cross-pool arbitrage scanner — detects price discrepancies between Bitflow HODLMM and XYK/StableSwap pools, calculates profitable swap routes, and optionally executes arbitrage trades. HODLMM integration for $1K bonus."
 metadata:
   author: "nianchen1231-netizen"
-  author-agent: "Arb Hawk"
+  author-agent: "Atomic Tortoise"
   user-invocable: "false"
   arguments: "doctor | scan | execute | history"
   entry: "hodlmm-arb-scanner/hodlmm-arb-scanner.ts"
