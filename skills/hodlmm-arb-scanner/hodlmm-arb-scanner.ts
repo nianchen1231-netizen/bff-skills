@@ -20,6 +20,7 @@ import { join } from "path";
 
 const HODLMM_API = "https://bff.bitflowapis.finance/api";
 const SDK_API = "https://bitflowsdk-api-test-7owjsmt8.uk.gateway.dev";
+const STACKS_API = "https://api.mainnet.hiro.so";
 
 const HISTORY_DIR = join(
   process.env.HOME ?? "/tmp",
@@ -314,11 +315,57 @@ function hodlmmEffectivePrice(
 
 /**
  * Derive effective price from XYK/StableSwap pool using ticker last_price.
- * last_price represents the price of the base token in terms of the target token.
  */
 function xykEffectivePrice(pool: XykPool): number | null {
   if (pool.lastPrice > 0) return pool.lastPrice;
   return null;
+}
+
+/**
+ * Read on-chain reserves from a Bitflow XYK pool contract via Hiro read-only call.
+ * Returns { xBalance, yBalance } in raw atomic units.
+ */
+async function readOnChainReserves(
+  poolTrait: string
+): Promise<{ xBalance: number; yBalance: number } | null> {
+  if (!poolTrait) return null;
+  const dotIdx = poolTrait.indexOf(".");
+  if (dotIdx === -1) return null;
+  const addr = poolTrait.substring(0, dotIdx);
+  const name = poolTrait.substring(dotIdx + 1);
+
+  try {
+    const resp = await fetch(
+      `${STACKS_API}/v2/contracts/call-read/${addr}/${name}/get-pool`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sender: addr, arguments: [] }),
+        signal: AbortSignal.timeout(10_000),
+      }
+    );
+    const data = (await resp.json()) as { okay: boolean; result: string };
+    if (!data.okay) return null;
+
+    const hex = data.result;
+    const findUint = (fieldName: string): number | null => {
+      const nameHex = Buffer.from(fieldName).toString("hex");
+      const idx = hex.indexOf(nameHex);
+      if (idx === -1) return null;
+      const afterName = idx + nameHex.length;
+      // uint type marker = "01", followed by 32 hex chars (16 bytes)
+      const typeIdx = hex.indexOf("01", afterName);
+      if (typeIdx < 0 || typeIdx > afterName + 4) return null;
+      return parseInt(hex.substring(typeIdx + 2, typeIdx + 34), 16);
+    };
+
+    const xBalance = findUint("x-balance");
+    const yBalance = findUint("y-balance");
+    if (xBalance == null || yBalance == null) return null;
+    return { xBalance, yBalance };
+  } catch {
+    return null;
+  }
 }
 
 // ─── Token pair matching ─────────────────────────────────────────────────────
@@ -503,9 +550,58 @@ async function cmdScan(thresholdBps?: number): Promise<JsonOutput> {
     if (h.tokenYPriceUsd > 0) tokenPriceUsd.set(normalizeToken(h.tokenY), h.tokenYPriceUsd);
   }
 
+  // Build set of HODLMM pair keys for targeted on-chain reads
+  const hodlmmPairKeys = new Set(hodlmmPools.map((h) => pairKey(h.tokenX, h.tokenY)));
+
+  // For XYK pools that overlap with HODLMM pairs, read on-chain reserves
+  const xykWithOnChain: Array<{ pool: typeof xykPools[0]; reserves: { xBalance: number; yBalance: number } | null }> = [];
+  const ON_CHAIN_CONCURRENCY = 3;
+
+  // First pass: identify which pools need on-chain reads
+  const needsOnChain = xykPools.filter((x) => {
+    const key = pairKey(x.token0, x.token1);
+    return hodlmmPairKeys.has(key) && x.poolTrait;
+  });
+
+  // Read on-chain reserves in batches
+  for (let i = 0; i < needsOnChain.length; i += ON_CHAIN_CONCURRENCY) {
+    const batch = needsOnChain.slice(i, i + ON_CHAIN_CONCURRENCY);
+    const results = await Promise.allSettled(
+      batch.map((x) => readOnChainReserves(x.poolTrait))
+    );
+    results.forEach((r, idx) => {
+      xykWithOnChain.push({
+        pool: batch[idx],
+        reserves: r.status === "fulfilled" ? r.value : null,
+      });
+    });
+  }
+
+  // Token decimals index (from HODLMM data)
+  const tokenDecimals = new Map<string, number>();
+  for (const h of hodlmmPools) {
+    if (h.tokenXDecimals) tokenDecimals.set(normalizeToken(h.tokenX), h.tokenXDecimals);
+    if (h.tokenYDecimals) tokenDecimals.set(normalizeToken(h.tokenY), h.tokenYDecimals);
+  }
+
   for (const x of xykPools) {
-    // Try ticker price first, fall back to USD-derived price
     let price = xykEffectivePrice(x);
+
+    // Try on-chain reserves for pools that overlap with HODLMM
+    if ((price == null || price <= 0)) {
+      const onChain = xykWithOnChain.find((o) => o.pool === x);
+      if (onChain?.reserves) {
+        const xDec = tokenDecimals.get(normalizeToken(x.token0)) || 6;
+        const yDec = tokenDecimals.get(normalizeToken(x.token1)) || 6;
+        const xHuman = onChain.reserves.xBalance / Math.pow(10, xDec);
+        const yHuman = onChain.reserves.yBalance / Math.pow(10, yDec);
+        if (xHuman > 0 && yHuman > 0) {
+          price = yHuman / xHuman; // price of token0 in terms of token1
+        }
+      }
+    }
+
+    // Fallback to USD-derived price
     if ((price == null || price <= 0) && x.token0 && x.token1) {
       const p0 = tokenPriceUsd.get(normalizeToken(x.token0));
       const p1 = tokenPriceUsd.get(normalizeToken(x.token1));
@@ -513,6 +609,7 @@ async function cmdScan(thresholdBps?: number): Promise<JsonOutput> {
         price = p0 / p1;
       }
     }
+
     if (price != null && price > 0) {
       allPools.push({
         id: x.poolId, dex: x.dex,
