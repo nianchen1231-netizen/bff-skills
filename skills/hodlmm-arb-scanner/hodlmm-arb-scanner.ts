@@ -18,7 +18,9 @@ import { join } from "path";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const BITFLOW_API = "https://api.bitflow.finance/api/v1";
+const HODLMM_API = "https://bff.bitflowapis.finance/api";
+const SDK_API = "https://bitflowsdk-api-test-7owjsmt8.uk.gateway.dev";
+
 const HISTORY_DIR = join(
   process.env.HOME ?? "/tmp",
   ".hodlmm-arb-scanner"
@@ -32,18 +34,43 @@ const RETRY_DELAY_MS = 2_000;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
+interface HodlmmTokenInfo {
+  contract: string;
+  symbol: string;
+  decimals: number;
+  priceUsd: number;
+}
+
+interface HodlmmPoolRaw {
+  poolId: string;
+  poolContract: string;
+  poolStatus: string;
+  tokens: {
+    tokenX: HodlmmTokenInfo;
+    tokenY: HodlmmTokenInfo;
+  };
+  tvlUsd: number;
+  volumeUsd1d: number;
+  apr: number;
+  baseFee: number;
+  binStep: number;
+  poolComposition: unknown;
+}
+
 interface HodlmmPool {
   poolId: string;
-  tokenX: string;
+  poolContract: string;
+  tokenX: string; // contract address
   tokenY: string;
-  tokenXSymbol?: string;
-  tokenYSymbol?: string;
-  activeBinId?: number;
-  binStep?: number;
-  reserveX?: string;
-  reserveY?: string;
-  feeBps?: number;
-  liquidity?: string;
+  tokenXSymbol: string;
+  tokenYSymbol: string;
+  tokenXPriceUsd: number;
+  tokenYPriceUsd: number;
+  tokenXDecimals: number;
+  tokenYDecimals: number;
+  tvlUsd: number;
+  baseFee: number;
+  binStep: number;
 }
 
 interface HodlmmBin {
@@ -54,15 +81,34 @@ interface HodlmmBin {
   isActive: boolean;
 }
 
+interface XykPoolRaw {
+  contract: string;
+  dex: string;
+  poolData: {
+    "pool-trait": string;
+    xToken: string;
+    yToken: string;
+  };
+  tokenX: string;
+  tokenY: string;
+}
+
+interface TickerEntry {
+  base_currency: string;
+  target_currency: string;
+  pool_id: string;
+  last_price: number;
+  liquidity_in_usd: number;
+  base_volume: number;
+}
+
 interface XykPool {
-  poolId: string;
-  token0: string;
-  token1: string;
-  token0Symbol?: string;
-  token1Symbol?: string;
-  reserve0: string;
-  reserve1: string;
-  feeBps?: number;
+  poolId: string;    // contract address (the dex contract)
+  poolTrait: string; // pool-trait from poolData
+  token0: string;    // contract address from poolData.xToken
+  token1: string;    // contract address from poolData.yToken
+  lastPrice: number; // from ticker API (price of token0 in terms of token1)
+  feeBps: number;
   type: "xyk" | "stableswap";
 }
 
@@ -82,11 +128,10 @@ interface ArbOpportunity {
   detectedAt: string;
 }
 
-interface SwapQuote {
+interface SwapRoute {
   route: unknown[];
   expectedOutput: string;
   priceImpactPct: number;
-  fee: string;
 }
 
 interface HistoryEntry {
@@ -97,7 +142,7 @@ interface HistoryEntry {
     poolId: string;
     amount: number;
     direction: string;
-    quote: SwapQuote | null;
+    quote: SwapRoute | null;
     txId: string | null;
     status: "success" | "failed" | "simulated";
     error?: string;
@@ -160,7 +205,6 @@ function loadHistory(): HistoryEntry[] {
 function appendHistory(entry: HistoryEntry): void {
   const history = loadHistory();
   history.push(entry);
-  // Keep bounded
   const trimmed = history.slice(-MAX_HISTORY_ENTRIES);
   writeFileSync(HISTORY_FILE, JSON.stringify(trimmed, null, 2), "utf-8");
 }
@@ -168,79 +212,112 @@ function appendHistory(entry: HistoryEntry): void {
 // ─── Pool data fetching ──────────────────────────────────────────────────────
 
 async function fetchHodlmmPools(): Promise<HodlmmPool[]> {
-  const data = await fetchJson<HodlmmPool[] | { pools: HodlmmPool[] }>(
-    `${BITFLOW_API}/hodlmm/pools`
+  const resp = await fetchJson<{ data: HodlmmPoolRaw[] }>(
+    `${HODLMM_API}/app/v1/pools`
   );
-  return Array.isArray(data) ? data : data.pools ?? [];
+  const rawPools = resp.data ?? [];
+  return rawPools.map((p) => ({
+    poolId: p.poolId,
+    poolContract: p.poolContract,
+    tokenX: p.tokens.tokenX.contract,
+    tokenY: p.tokens.tokenY.contract,
+    tokenXSymbol: p.tokens.tokenX.symbol,
+    tokenYSymbol: p.tokens.tokenY.symbol,
+    tokenXPriceUsd: p.tokens.tokenX.priceUsd,
+    tokenYPriceUsd: p.tokens.tokenY.priceUsd,
+    tokenXDecimals: p.tokens.tokenX.decimals,
+    tokenYDecimals: p.tokens.tokenY.decimals,
+    tvlUsd: p.tvlUsd,
+    baseFee: p.baseFee,
+    binStep: p.binStep,
+  }));
 }
 
 async function fetchHodlmmBins(poolId: string): Promise<HodlmmBin[]> {
   const data = await fetchJson<HodlmmBin[] | { bins: HodlmmBin[] }>(
-    `${BITFLOW_API}/hodlmm/pools/${encodeURIComponent(poolId)}/bins`
+    `${HODLMM_API}/quotes/v1/bins/${encodeURIComponent(poolId)}`
   );
-  return Array.isArray(data) ? data : data.bins ?? [];
+  return Array.isArray(data) ? data : (data as { bins: HodlmmBin[] }).bins ?? [];
+}
+
+async function fetchTickerData(): Promise<TickerEntry[]> {
+  return fetchJson<TickerEntry[]>(`${SDK_API}/ticker`);
 }
 
 async function fetchXykPools(): Promise<XykPool[]> {
-  // Bitflow exposes XYK pools at /pools and stableswap at /stableswap/pools
-  const [xykRaw, stableRaw] = await Promise.allSettled([
-    fetchJson<XykPool[] | { pools: XykPool[] }>(`${BITFLOW_API}/pools`),
-    fetchJson<XykPool[] | { pools: XykPool[] }>(
-      `${BITFLOW_API}/stableswap/pools`
-    ),
+  const [rawPools, tickerEntries] = await Promise.all([
+    fetchJson<XykPoolRaw[]>(`${SDK_API}/getAllPools`),
+    fetchTickerData(),
   ]);
 
-  const extract = (
-    result: PromiseSettledResult<XykPool[] | { pools: XykPool[] }>,
-    type: "xyk" | "stableswap"
-  ): XykPool[] => {
-    if (result.status !== "fulfilled") return [];
-    const val = result.value;
-    const arr = Array.isArray(val) ? val : val.pools ?? [];
-    return arr.map((p) => ({ ...p, type }));
-  };
+  // Index ticker data by pool_id (the pool-trait) for fast lookup
+  const tickerByPoolId = new Map<string, TickerEntry>();
+  for (const t of tickerEntries) {
+    tickerByPoolId.set(normalizeToken(t.pool_id), t);
+  }
 
-  return [...extract(xykRaw, "xyk"), ...extract(stableRaw, "stableswap")];
+  return rawPools
+    .filter(
+      (p) =>
+        p.dex.includes("BITFLOW_XYK") || p.dex.includes("BITFLOW_STABLE")
+    )
+    .map((p) => {
+      const poolTrait = p.poolData["pool-trait"] ?? "";
+      const poolType: "xyk" | "stableswap" = p.dex.includes("BITFLOW_STABLE")
+        ? "stableswap"
+        : "xyk";
+
+      // Look up ticker price by pool-trait
+      const ticker = tickerByPoolId.get(normalizeToken(poolTrait));
+      const lastPrice = ticker?.last_price ?? 0;
+
+      // Default fee for XYK pools (30 bps) since the API no longer provides swap-fee
+      const feeBps = 30;
+
+      return {
+        poolId: p.contract,
+        poolTrait,
+        token0: p.poolData.xToken,
+        token1: p.poolData.yToken,
+        lastPrice,
+        feeBps,
+        type: poolType,
+      };
+    })
+    .filter((p) => p.token0 && p.token1); // drop pools with missing token info
 }
 
 // ─── Price derivation ────────────────────────────────────────────────────────
 
 /**
- * Derive effective price from HODLMM active bin.
- * Price = pricePerToken of the active bin, or derived from bin reserves.
+ * Derive effective price from HODLMM pool.
+ * Uses priceUsd from token data: price of tokenX in terms of tokenY = priceUsdX / priceUsdY.
+ * Falls back to active bin price if available.
  */
 function hodlmmEffectivePrice(
   pool: HodlmmPool,
   bins: HodlmmBin[]
 ): number | null {
-  // Try active bin first
+  // Primary: use USD prices from the pool API
+  if (pool.tokenXPriceUsd > 0 && pool.tokenYPriceUsd > 0) {
+    return pool.tokenXPriceUsd / pool.tokenYPriceUsd;
+  }
+
+  // Fallback: try active bin
   const activeBin = bins.find((b) => b.isActive);
   if (activeBin && activeBin.pricePerToken > 0) {
     return activeBin.pricePerToken;
   }
 
-  // Fallback: find the bin matching activeBinId
-  if (pool.activeBinId != null) {
-    const bin = bins.find((b) => b.binId === pool.activeBinId);
-    if (bin && bin.pricePerToken > 0) return bin.pricePerToken;
-  }
-
-  // Fallback: derive from pool reserves
-  const rx = parseFloat(pool.reserveX ?? "0");
-  const ry = parseFloat(pool.reserveY ?? "0");
-  if (rx > 0 && ry > 0) return ry / rx;
-
   return null;
 }
 
 /**
- * Derive effective price from XYK/StableSwap reserves.
- * Price of token0 in terms of token1 = reserve1 / reserve0.
+ * Derive effective price from XYK/StableSwap pool using ticker last_price.
+ * last_price represents the price of the base token in terms of the target token.
  */
 function xykEffectivePrice(pool: XykPool): number | null {
-  const r0 = parseFloat(pool.reserve0 ?? "0");
-  const r1 = parseFloat(pool.reserve1 ?? "0");
-  if (r0 > 0 && r1 > 0) return r1 / r0;
+  if (pool.lastPrice > 0) return pool.lastPrice;
   return null;
 }
 
@@ -248,10 +325,9 @@ function xykEffectivePrice(pool: XykPool): number | null {
 
 /**
  * Normalize a token contract address for matching.
- * Handles both principal.name format and raw addresses.
  */
-function normalizeToken(t: string): string {
-  return t.trim().toLowerCase();
+function normalizeToken(t: string | undefined | null): string {
+  return (t || "").trim().toLowerCase();
 }
 
 /**
@@ -263,28 +339,23 @@ function pairKey(tokenA: string, tokenB: string): string {
   return a < b ? `${a}|${b}` : `${b}|${a}`;
 }
 
-function pairLabel(
-  hodlmm: HodlmmPool,
-  xyk: XykPool
-): string {
-  const a = hodlmm.tokenXSymbol ?? hodlmm.tokenX.split(".").pop() ?? "?";
-  const b = hodlmm.tokenYSymbol ?? hodlmm.tokenY.split(".").pop() ?? "?";
+function pairLabel(hodlmm: HodlmmPool): string {
+  const a = hodlmm.tokenXSymbol || hodlmm.tokenX.split(".").pop() || "?";
+  const b = hodlmm.tokenYSymbol || hodlmm.tokenY.split(".").pop() || "?";
   return `${a}/${b}`;
 }
 
 // ─── Swap quote ──────────────────────────────────────────────────────────────
 
-async function fetchSwapQuote(
+async function fetchSwapRoutes(
   fromToken: string,
-  toToken: string,
-  amount: number
-): Promise<SwapQuote> {
+  toToken: string
+): Promise<unknown> {
   const url =
-    `${BITFLOW_API}/swap/quote` +
-    `?from=${encodeURIComponent(fromToken)}` +
-    `&to=${encodeURIComponent(toToken)}` +
-    `&amount=${amount}`;
-  return fetchJson<SwapQuote>(url);
+    `${SDK_API}/getAllRoutes` +
+    `?tokenX=${encodeURIComponent(fromToken)}` +
+    `&tokenY=${encodeURIComponent(toToken)}`;
+  return fetchJson<unknown>(url);
 }
 
 // ─── Commands ────────────────────────────────────────────────────────────────
@@ -292,43 +363,56 @@ async function fetchSwapQuote(
 async function cmdDoctor(): Promise<JsonOutput> {
   const checks: Record<string, unknown> = {};
 
-  // 1. Check main API
-  try {
-    const start = Date.now();
-    await fetchJson(`${BITFLOW_API}/pools`);
-    checks.xykApi = { ok: true, latencyMs: Date.now() - start };
-  } catch (err) {
-    checks.xykApi = {
-      ok: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
-  }
-
-  // 2. Check HODLMM API
+  // 1. Check HODLMM pools API
   let hodlmmPools: HodlmmPool[] = [];
   try {
     const start = Date.now();
     hodlmmPools = await fetchHodlmmPools();
     checks.hodlmmApi = {
       ok: true,
+      url: `${HODLMM_API}/app/v1/pools`,
       latencyMs: Date.now() - start,
       poolCount: hodlmmPools.length,
     };
   } catch (err) {
     checks.hodlmmApi = {
       ok: false,
+      url: `${HODLMM_API}/app/v1/pools`,
       error: err instanceof Error ? err.message : String(err),
     };
   }
 
-  // 3. Check StableSwap API
+  // 2. Check XYK/Stable pools API (SDK)
   try {
     const start = Date.now();
-    await fetchJson(`${BITFLOW_API}/stableswap/pools`);
-    checks.stableswapApi = { ok: true, latencyMs: Date.now() - start };
+    const xykPools = await fetchXykPools();
+    checks.xykSdkApi = {
+      ok: true,
+      url: `${SDK_API}/getAllPools`,
+      latencyMs: Date.now() - start,
+      poolCount: xykPools.length,
+    };
   } catch (err) {
-    checks.stableswapApi = {
+    checks.xykSdkApi = {
       ok: false,
+      url: `${SDK_API}/getAllPools`,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  // 3. Check ticker API
+  try {
+    const start = Date.now();
+    await fetchJson(`${SDK_API}/ticker`);
+    checks.tickerApi = {
+      ok: true,
+      url: `${SDK_API}/ticker`,
+      latencyMs: Date.now() - start,
+    };
+  } catch (err) {
+    checks.tickerApi = {
+      ok: false,
+      url: `${SDK_API}/ticker`,
       error: err instanceof Error ? err.message : String(err),
     };
   }
@@ -341,7 +425,10 @@ async function cmdDoctor(): Promise<JsonOutput> {
   };
 
   const allOk = Object.values(checks).every(
-    (c) => typeof c === "object" && c !== null && (c as { ok?: boolean }).ok !== false
+    (c) =>
+      typeof c === "object" &&
+      c !== null &&
+      (c as { ok?: boolean }).ok !== false
   );
 
   return {
@@ -350,10 +437,15 @@ async function cmdDoctor(): Promise<JsonOutput> {
     checks,
     hodlmmPools: hodlmmPools.map((p) => ({
       poolId: p.poolId,
-      tokenX: p.tokenXSymbol ?? p.tokenX,
-      tokenY: p.tokenYSymbol ?? p.tokenY,
-      activeBinId: p.activeBinId,
-      feeBps: p.feeBps,
+      tokenX: p.tokenXSymbol,
+      tokenXContract: p.tokenX,
+      tokenY: p.tokenYSymbol,
+      tokenYContract: p.tokenY,
+      tokenXPriceUsd: p.tokenXPriceUsd,
+      tokenYPriceUsd: p.tokenYPriceUsd,
+      tvlUsd: p.tvlUsd,
+      baseFee: p.baseFee,
+      binStep: p.binStep,
     })),
   };
 }
@@ -377,7 +469,7 @@ async function cmdScan(thresholdBps?: number): Promise<JsonOutput> {
     };
   }
 
-  // Index XYK pools by pair key
+  // Index XYK pools by pair key (matching on token contract addresses)
   const xykByPair = new Map<string, XykPool[]>();
   for (const pool of xykPools) {
     const key = pairKey(pool.token0, pool.token1);
@@ -415,11 +507,6 @@ async function cmdScan(thresholdBps?: number): Promise<JsonOutput> {
     if (hPrice == null || hPrice <= 0) continue;
 
     for (const xyk of matchingXyk) {
-      // Ensure token ordering matches for price comparison
-      const hodlmmForward = pairKey(hodlmm.tokenX, hodlmm.tokenY);
-      const xykForward = pairKey(xyk.token0, xyk.token1);
-      if (hodlmmForward !== xykForward) continue;
-
       // Determine if tokens are in same order
       const sameOrder =
         normalizeToken(hodlmm.tokenX) === normalizeToken(xyk.token0);
@@ -442,14 +529,15 @@ async function cmdScan(thresholdBps?: number): Promise<JsonOutput> {
         hPrice < xPrice ? "buy_hodlmm_sell_xyk" : "buy_xyk_sell_hodlmm";
 
       // Estimate profit after fees
-      const hodlmmFee = hodlmm.feeBps ?? 30;
+      // HODLMM baseFee is typically in bps already
+      const hodlmmFee = Math.round(hodlmm.baseFee) || 30;
       const xykFee = xyk.feeBps ?? 30;
       const totalFeeBps = hodlmmFee + xykFee;
       const profitBps = Math.max(0, spreadBps - totalFeeBps);
 
       if (spreadBps >= threshold) {
         opportunities.push({
-          pair: pairLabel(hodlmm, xyk),
+          pair: pairLabel(hodlmm),
           hodlmmPoolId: hodlmm.poolId,
           xykPoolId: xyk.poolId,
           xykPoolType: xyk.type,
@@ -506,17 +594,14 @@ async function cmdExecute(
     };
   }
 
-  // 1. Fetch the HODLMM pool
-  let hodlmm: HodlmmPool;
-  try {
-    hodlmm = await fetchJson<HodlmmPool>(
-      `${BITFLOW_API}/hodlmm/pools/${encodeURIComponent(poolId)}`
-    );
-  } catch (err) {
+  // 1. Fetch all HODLMM pools and find the target
+  const hodlmmPools = await fetchHodlmmPools();
+  const hodlmm = hodlmmPools.find((p) => p.poolId === poolId);
+  if (!hodlmm) {
     return {
       ok: false,
       command: "execute",
-      error: `Failed to fetch HODLMM pool ${poolId}: ${err instanceof Error ? err.message : err}`,
+      error: `HODLMM pool ${poolId} not found. Available: ${hodlmmPools.map((p) => p.poolId).join(", ")}`,
     };
   }
 
@@ -535,7 +620,7 @@ async function cmdExecute(
     return {
       ok: false,
       command: "execute",
-      error: `No XYK/StableSwap pool found for pair ${hodlmm.tokenX}/${hodlmm.tokenY}.`,
+      error: `No XYK/StableSwap pool found for pair ${hodlmm.tokenXSymbol}/${hodlmm.tokenYSymbol} (${hodlmm.tokenX} / ${hodlmm.tokenY}).`,
     };
   }
 
@@ -556,7 +641,8 @@ async function cmdExecute(
     if (sBps > bestSpreadBps) {
       bestSpreadBps = sBps;
       bestXyk = xyk;
-      direction = hPrice < xPrice ? "buy_hodlmm_sell_xyk" : "buy_xyk_sell_hodlmm";
+      direction =
+        hPrice < xPrice ? "buy_hodlmm_sell_xyk" : "buy_xyk_sell_hodlmm";
     }
   }
 
@@ -569,15 +655,15 @@ async function cmdExecute(
     };
   }
 
-  // 4. Get swap quote from Bitflow
+  // 4. Get swap routes from Bitflow SDK API
   const fromToken =
     direction === "buy_hodlmm_sell_xyk" ? hodlmm.tokenX : bestXyk.token0;
   const toToken =
     direction === "buy_hodlmm_sell_xyk" ? hodlmm.tokenY : bestXyk.token1;
 
-  let quote: SwapQuote | null = null;
+  let routes: unknown = null;
   try {
-    quote = await fetchSwapQuote(fromToken, toToken, amountSats);
+    routes = await fetchSwapRoutes(fromToken, toToken);
   } catch (err) {
     const entry: HistoryEntry = {
       type: "execute",
@@ -589,7 +675,7 @@ async function cmdExecute(
         quote: null,
         txId: null,
         status: "failed",
-        error: `Quote failed: ${err instanceof Error ? err.message : err}`,
+        error: `Route fetch failed: ${err instanceof Error ? err.message : err}`,
       },
     };
     appendHistory(entry);
@@ -597,12 +683,11 @@ async function cmdExecute(
     return {
       ok: false,
       command: "execute",
-      error: `Failed to get swap quote: ${err instanceof Error ? err.message : err}`,
+      error: `Failed to get swap routes: ${err instanceof Error ? err.message : err}`,
     };
   }
 
   // 5. Report the quote — actual signing must be done by the caller (BFF runtime)
-  // The skill outputs the swap parameters; the runtime handles wallet signing.
   const executionResult = {
     poolId,
     amount: amountSats,
@@ -610,11 +695,11 @@ async function cmdExecute(
     fromToken,
     toToken,
     spreadBps: bestSpreadBps,
-    quote,
+    routes,
     txId: null as string | null,
     status: "simulated" as const,
     message:
-      "Swap quote retrieved. Execution requires wallet signing by the BFF runtime. " +
+      "Swap routes retrieved. Execution requires wallet signing by the BFF runtime. " +
       "Pass this output to the signing pipeline to broadcast the transaction.",
   };
 
@@ -622,7 +707,12 @@ async function cmdExecute(
     type: "execute",
     timestamp: new Date().toISOString(),
     execution: {
-      ...executionResult,
+      poolId,
+      amount: amountSats,
+      direction,
+      quote: null,
+      txId: null,
+      status: "simulated",
     },
   });
 
