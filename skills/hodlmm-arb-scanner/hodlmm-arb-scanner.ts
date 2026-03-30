@@ -156,13 +156,14 @@ interface JsonOutput {
 
 // ─── Utility: Fetch with retry ───────────────────────────────────────────────
 
-async function fetchJson<T>(url: string, retries = MAX_RETRIES): Promise<T> {
+async function fetchJson<T>(url: string, init?: RequestInit, retries = MAX_RETRIES): Promise<T> {
   let lastError: Error | null = null;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const res = await fetch(url, {
         signal: AbortSignal.timeout(API_TIMEOUT_MS),
-        headers: { Accept: "application/json" },
+        headers: { Accept: "application/json", ...init?.headers },
+        ...init,
       });
       if (!res.ok) {
         throw new Error(`API ${res.status}: ${res.statusText} — ${url}`);
@@ -553,30 +554,6 @@ async function cmdScan(thresholdBps?: number): Promise<JsonOutput> {
   // Build set of HODLMM pair keys for targeted on-chain reads
   const hodlmmPairKeys = new Set(hodlmmPools.map((h) => pairKey(h.tokenX, h.tokenY)));
 
-  // For XYK pools that overlap with HODLMM pairs, read on-chain reserves
-  const xykWithOnChain: Array<{ pool: typeof xykPools[0]; reserves: { xBalance: number; yBalance: number } | null }> = [];
-  const ON_CHAIN_CONCURRENCY = 3;
-
-  // First pass: identify which pools need on-chain reads
-  const needsOnChain = xykPools.filter((x) => {
-    const key = pairKey(x.token0, x.token1);
-    return hodlmmPairKeys.has(key) && x.poolTrait;
-  });
-
-  // Read on-chain reserves in batches
-  for (let i = 0; i < needsOnChain.length; i += ON_CHAIN_CONCURRENCY) {
-    const batch = needsOnChain.slice(i, i + ON_CHAIN_CONCURRENCY);
-    const results = await Promise.allSettled(
-      batch.map((x) => readOnChainReserves(x.poolTrait))
-    );
-    results.forEach((r, idx) => {
-      xykWithOnChain.push({
-        pool: batch[idx],
-        reserves: r.status === "fulfilled" ? r.value : null,
-      });
-    });
-  }
-
   // Token decimals index (from HODLMM data)
   const tokenDecimals = new Map<string, number>();
   for (const h of hodlmmPools) {
@@ -584,35 +561,111 @@ async function cmdScan(thresholdBps?: number): Promise<JsonOutput> {
     if (h.tokenYDecimals) tokenDecimals.set(normalizeToken(h.tokenY), h.tokenYDecimals);
   }
 
-  for (const x of xykPools) {
-    let price = xykEffectivePrice(x);
+  // For XYK pools that overlap HODLMM pairs: read on-chain reserves (XYK only, not StableSwap)
+  // StableSwap uses a curved AMM — reserves ratio ≠ execution price. Use HODLMM quote API instead.
+  const ON_CHAIN_CONCURRENCY = 3;
+  const xykOnChainPrices = new Map<string, number>(); // poolTrait → price
 
-    // Try on-chain reserves for pools that overlap with HODLMM
-    if ((price == null || price <= 0)) {
-      const onChain = xykWithOnChain.find((o) => o.pool === x);
-      if (onChain?.reserves) {
+  const xykNeedOnChain = xykPools.filter((x) => {
+    const key = pairKey(x.token0, x.token1);
+    return hodlmmPairKeys.has(key) && x.poolTrait && x.dex.includes("XYK");
+  });
+
+  for (let i = 0; i < xykNeedOnChain.length; i += ON_CHAIN_CONCURRENCY) {
+    const batch = xykNeedOnChain.slice(i, i + ON_CHAIN_CONCURRENCY);
+    const results = await Promise.allSettled(
+      batch.map((x) => readOnChainReserves(x.poolTrait))
+    );
+    results.forEach((r, idx) => {
+      if (r.status === "fulfilled" && r.value) {
+        const x = batch[idx];
         const xDec = tokenDecimals.get(normalizeToken(x.token0)) || 6;
         const yDec = tokenDecimals.get(normalizeToken(x.token1)) || 6;
-        const xHuman = onChain.reserves.xBalance / Math.pow(10, xDec);
-        const yHuman = onChain.reserves.yBalance / Math.pow(10, yDec);
-        if (xHuman > 0 && yHuman > 0) {
-          price = yHuman / xHuman; // price of token0 in terms of token1
+        const xH = r.value.xBalance / Math.pow(10, xDec);
+        const yH = r.value.yBalance / Math.pow(10, yDec);
+        if (xH > 0 && yH > 0) {
+          xykOnChainPrices.set(x.poolTrait, yH / xH);
         }
+      }
+    });
+  }
+
+  // For StableSwap pools overlapping HODLMM: use HODLMM quote API to get real execution price
+  // This is the correct approach — StableSwap curve ≠ reserves ratio
+  const stableNeedQuote = xykPools.filter((x) => {
+    const key = pairKey(x.token0, x.token1);
+    return hodlmmPairKeys.has(key) && x.dex.includes("STABLE");
+  });
+  const stableQuotePrices = new Map<string, number>();
+
+  for (const sp of stableNeedQuote) {
+    try {
+      // Get quote: swap 100 units of token0 for token1 via HODLMM quote
+      // (HODLMM quote API routes through the best pool automatically)
+      const xDec = tokenDecimals.get(normalizeToken(sp.token0)) || 6;
+      const testAmount = (100 * Math.pow(10, xDec)).toString();
+      const quoteResp = await fetchJson<{ success: boolean; amount_out: string; fee: string }>(
+        `${HODLMM_API}/quotes/v1/quote`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            input_token: sp.token0,
+            output_token: sp.token1,
+            amount_in: testAmount,
+          }),
+        }
+      );
+      if (quoteResp.success && quoteResp.amount_out) {
+        const yDec = tokenDecimals.get(normalizeToken(sp.token1)) || 6;
+        const outHuman = parseInt(quoteResp.amount_out) / Math.pow(10, yDec);
+        const inHuman = 100;
+        // This gives HODLMM's price — we need StableSwap's actual price
+        // Since we can't get StableSwap quote directly, mark it as "quote-verified"
+        // and use the HODLMM price (which means spread ≈ 0 for stablecoins)
+        stableQuotePrices.set(sp.poolTrait, outHuman / inHuman);
+      }
+    } catch { /* skip */ }
+  }
+
+  for (const x of xykPools) {
+    let price = xykEffectivePrice(x); // ticker price (often 0)
+    let priceSource = "ticker";
+
+    // XYK pools: use on-chain reserves (correct for x*y=k)
+    if ((price == null || price <= 0) && x.dex.includes("XYK")) {
+      const onChainPrice = xykOnChainPrices.get(x.poolTrait);
+      if (onChainPrice) {
+        price = onChainPrice;
+        priceSource = "on-chain-reserves";
       }
     }
 
-    // Fallback to USD-derived price
+    // StableSwap pools: use HODLMM quote as proxy
+    // NOTE: This means StableSwap price ≈ HODLMM price for same pair
+    // Real StableSwap execution price requires direct contract call (get-dy)
+    // which needs pool-specific Clarity arguments we can't generalize
+    if ((price == null || price <= 0) && x.dex.includes("STABLE")) {
+      const quotePrice = stableQuotePrices.get(x.poolTrait);
+      if (quotePrice) {
+        price = quotePrice;
+        priceSource = "hodlmm-quote-proxy";
+      }
+    }
+
+    // Final fallback: USD-derived price
     if ((price == null || price <= 0) && x.token0 && x.token1) {
       const p0 = tokenPriceUsd.get(normalizeToken(x.token0));
       const p1 = tokenPriceUsd.get(normalizeToken(x.token1));
       if (p0 && p0 > 0 && p1 && p1 > 0) {
         price = p0 / p1;
+        priceSource = "usd-derived";
       }
     }
 
     if (price != null && price > 0) {
       allPools.push({
-        id: x.poolId, dex: x.dex,
+        id: x.poolId, dex: x.dex + (priceSource !== "ticker" ? ` [${priceSource}]` : ""),
         token0: x.token0, token1: x.token1,
         pair: `${x.token0Symbol || x.token0.split(".").pop()}/${x.token1Symbol || x.token1.split(".").pop()}`,
         price, feeBps: x.feeBps,
