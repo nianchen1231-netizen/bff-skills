@@ -107,24 +107,22 @@ interface XykPool {
   poolTrait: string; // pool-trait from poolData
   token0: string;    // contract address from poolData.xToken
   token1: string;    // contract address from poolData.yToken
+  token0Symbol: string;
+  token1Symbol: string;
   lastPrice: number; // from ticker API (price of token0 in terms of token1)
+  liquidityUsd: number;
   feeBps: number;
+  dex: string;       // which DEX (ALEX, VELAR, BITFLOW_XYK, etc.)
   type: "xyk" | "stableswap";
 }
 
 interface ArbOpportunity {
   pair: string;
-  hodlmmPoolId: string;
-  xykPoolId: string;
-  xykPoolType: string;
-  hodlmmPrice: number;
-  xykPrice: number;
+  cheapPool: { id: string; dex: string; price: number; feeBps: number };
+  expensivePool: { id: string; dex: string; price: number; feeBps: number };
   spreadPct: number;
   spreadBps: number;
-  direction: "buy_hodlmm_sell_xyk" | "buy_xyk_sell_hodlmm";
   estimatedProfitBps: number;
-  hodlmmFeeBps: number;
-  xykFeeBps: number;
   detectedAt: string;
 }
 
@@ -256,31 +254,33 @@ async function fetchXykPools(): Promise<XykPool[]> {
     tickerByPoolId.set(normalizeToken(t.pool_id), t);
   }
 
+  // Include ALL DEXes (ALEX, VELAR, BITFLOW) for cross-DEX arb
   return rawPools
-    .filter(
-      (p) =>
-        p.dex.includes("BITFLOW_XYK") || p.dex.includes("BITFLOW_STABLE")
-    )
     .map((p) => {
-      const poolTrait = p.poolData["pool-trait"] ?? "";
-      const poolType: "xyk" | "stableswap" = p.dex.includes("BITFLOW_STABLE")
+      const poolTrait = p.poolData?.["pool-trait"] ?? "";
+      const poolType: "xyk" | "stableswap" = (p.dex || "").includes("STABLE")
         ? "stableswap"
         : "xyk";
 
       // Look up ticker price by pool-trait
       const ticker = tickerByPoolId.get(normalizeToken(poolTrait));
       const lastPrice = ticker?.last_price ?? 0;
+      const liquidityUsd = ticker?.liquidity_in_usd ?? 0;
 
-      // Default fee for XYK pools (30 bps) since the API no longer provides swap-fee
+      // Fee: 30 bps default, ALEX often uses 30, VELAR uses 30
       const feeBps = 30;
 
       return {
         poolId: p.contract,
         poolTrait,
-        token0: p.poolData.xToken,
-        token1: p.poolData.yToken,
+        token0: p.poolData?.xToken || "",
+        token1: p.poolData?.yToken || "",
+        token0Symbol: p.tokenX || "",
+        token1Symbol: p.tokenY || "",
         lastPrice,
+        liquidityUsd,
         feeBps,
+        dex: p.dex || "unknown",
         type: poolType,
       };
     })
@@ -450,134 +450,144 @@ async function cmdDoctor(): Promise<JsonOutput> {
   };
 }
 
+// Unified pool entry for cross-DEX comparison
+interface UnifiedPool {
+  id: string;
+  dex: string;
+  token0: string;
+  token1: string;
+  pair: string;
+  price: number;
+  feeBps: number;
+}
+
 async function cmdScan(thresholdBps?: number): Promise<JsonOutput> {
   const threshold = thresholdBps ?? DEFAULT_SPREAD_THRESHOLD_BPS;
 
-  // Fetch both pool types in parallel
   const [hodlmmPools, xykPools] = await Promise.all([
     fetchHodlmmPools(),
     fetchXykPools(),
   ]);
 
-  if (hodlmmPools.length === 0) {
-    return {
-      ok: true,
-      command: "scan",
-      opportunities: [],
-      message: "No HODLMM pools found.",
-      scannedAt: new Date().toISOString(),
-    };
-  }
-
-  // Index XYK pools by pair key (matching on token contract addresses)
-  const xykByPair = new Map<string, XykPool[]>();
-  for (const pool of xykPools) {
-    const key = pairKey(pool.token0, pool.token1);
-    const arr = xykByPair.get(key) ?? [];
-    arr.push(pool);
-    xykByPair.set(key, arr);
-  }
-
-  // Fetch bins for all HODLMM pools in parallel (bounded concurrency)
+  // Fetch HODLMM bins
   const CONCURRENCY = 5;
   const binsMap = new Map<string, HodlmmBin[]>();
   for (let i = 0; i < hodlmmPools.length; i += CONCURRENCY) {
     const batch = hodlmmPools.slice(i, i + CONCURRENCY);
-    const results = await Promise.allSettled(
-      batch.map((p) => fetchHodlmmBins(p.poolId))
-    );
+    const results = await Promise.allSettled(batch.map((p) => fetchHodlmmBins(p.poolId)));
     results.forEach((r, idx) => {
-      binsMap.set(
-        batch[idx].poolId,
-        r.status === "fulfilled" ? r.value : []
-      );
+      binsMap.set(batch[idx].poolId, r.status === "fulfilled" ? r.value : []);
     });
   }
 
-  // Compare prices
-  const opportunities: ArbOpportunity[] = [];
+  // Build unified pool list — ALL DEXes
+  const allPools: UnifiedPool[] = [];
 
-  for (const hodlmm of hodlmmPools) {
-    const key = pairKey(hodlmm.tokenX, hodlmm.tokenY);
-    const matchingXyk = xykByPair.get(key);
-    if (!matchingXyk || matchingXyk.length === 0) continue;
+  for (const h of hodlmmPools) {
+    const bins = binsMap.get(h.poolId) ?? [];
+    const price = hodlmmEffectivePrice(h, bins);
+    if (price != null && price > 0) {
+      allPools.push({
+        id: h.poolId, dex: "HODLMM",
+        token0: h.tokenX, token1: h.tokenY,
+        pair: `${h.tokenXSymbol || h.tokenX.split(".").pop()}/${h.tokenYSymbol || h.tokenY.split(".").pop()}`,
+        price, feeBps: Math.round((h.baseFee || 0.003) * 10000),
+      });
+    }
+  }
 
-    const bins = binsMap.get(hodlmm.poolId) ?? [];
-    const hPrice = hodlmmEffectivePrice(hodlmm, bins);
-    if (hPrice == null || hPrice <= 0) continue;
+  // Build token price index from HODLMM data (reliable USD prices)
+  const tokenPriceUsd = new Map<string, number>();
+  for (const h of hodlmmPools) {
+    if (h.tokenXPriceUsd > 0) tokenPriceUsd.set(normalizeToken(h.tokenX), h.tokenXPriceUsd);
+    if (h.tokenYPriceUsd > 0) tokenPriceUsd.set(normalizeToken(h.tokenY), h.tokenYPriceUsd);
+  }
 
-    for (const xyk of matchingXyk) {
-      // Determine if tokens are in same order
-      const sameOrder =
-        normalizeToken(hodlmm.tokenX) === normalizeToken(xyk.token0);
-
-      let xPrice = xykEffectivePrice(xyk);
-      if (xPrice == null || xPrice <= 0) continue;
-
-      // If tokens are reversed, invert the XYK price
-      if (!sameOrder) {
-        xPrice = 1 / xPrice;
+  for (const x of xykPools) {
+    // Try ticker price first, fall back to USD-derived price
+    let price = xykEffectivePrice(x);
+    if ((price == null || price <= 0) && x.token0 && x.token1) {
+      const p0 = tokenPriceUsd.get(normalizeToken(x.token0));
+      const p1 = tokenPriceUsd.get(normalizeToken(x.token1));
+      if (p0 && p0 > 0 && p1 && p1 > 0) {
+        price = p0 / p1;
       }
+    }
+    if (price != null && price > 0) {
+      allPools.push({
+        id: x.poolId, dex: x.dex,
+        token0: x.token0, token1: x.token1,
+        pair: `${x.token0Symbol || x.token0.split(".").pop()}/${x.token1Symbol || x.token1.split(".").pop()}`,
+        price, feeBps: x.feeBps,
+      });
+    }
+  }
 
-      // Spread calculation
-      const spread = Math.abs(hPrice - xPrice) / Math.min(hPrice, xPrice);
-      const spreadBps = Math.round(spread * 10_000);
-      const spreadPct = parseFloat((spread * 100).toFixed(4));
+  // Group by canonical token pair
+  const byPair = new Map<string, UnifiedPool[]>();
+  for (const pool of allPools) {
+    const n0 = normalizeToken(pool.token0);
+    const n1 = normalizeToken(pool.token1);
+    const canonKey = n0 < n1 ? `${n0}|${n1}` : `${n1}|${n0}`;
+    const isReversed = !(n0 < n1);
+    if (isReversed && pool.price > 0) {
+      pool.price = 1 / pool.price;
+      [pool.token0, pool.token1] = [pool.token1, pool.token0];
+    }
+    const arr = byPair.get(canonKey) ?? [];
+    arr.push(pool);
+    byPair.set(canonKey, arr);
+  }
 
-      // Determine direction: buy cheap, sell expensive
-      const direction: ArbOpportunity["direction"] =
-        hPrice < xPrice ? "buy_hodlmm_sell_xyk" : "buy_xyk_sell_hodlmm";
+  // Find cross-DEX arb: pairs with 2+ pools on DIFFERENT DEXes
+  const opportunities: ArbOpportunity[] = [];
+  let pairsWithMultipleDexes = 0;
 
-      // Estimate profit after fees
-      // HODLMM baseFee is typically in bps already
-      const hodlmmFee = Math.round(hodlmm.baseFee) || 30;
-      const xykFee = xyk.feeBps ?? 30;
-      const totalFeeBps = hodlmmFee + xykFee;
-      const profitBps = Math.max(0, spreadBps - totalFeeBps);
+  for (const [, pools] of byPair) {
+    if (pools.length < 2) continue;
+    const dexes = new Set(pools.map((p) => p.dex));
+    if (dexes.size < 2) continue;
+    pairsWithMultipleDexes++;
 
-      if (spreadBps >= threshold) {
-        opportunities.push({
-          pair: pairLabel(hodlmm),
-          hodlmmPoolId: hodlmm.poolId,
-          xykPoolId: xyk.poolId,
-          xykPoolType: xyk.type,
-          hodlmmPrice: parseFloat(hPrice.toPrecision(8)),
-          xykPrice: parseFloat(xPrice.toPrecision(8)),
-          spreadPct,
-          spreadBps,
-          direction,
-          estimatedProfitBps: profitBps,
-          hodlmmFeeBps: hodlmmFee,
-          xykFeeBps: xykFee,
-          detectedAt: new Date().toISOString(),
-        });
+    // Compare every cross-DEX pair combination
+    for (let i = 0; i < pools.length; i++) {
+      for (let j = i + 1; j < pools.length; j++) {
+        if (pools[i].dex === pools[j].dex) continue;
+        const [cheap, exp] = pools[i].price < pools[j].price
+          ? [pools[i], pools[j]]
+          : [pools[j], pools[i]];
+
+        const spread = (exp.price - cheap.price) / cheap.price;
+        const spreadBps = Math.round(spread * 10_000);
+        const spreadPct = parseFloat((spread * 100).toFixed(4));
+        const profitBps = Math.max(0, spreadBps - cheap.feeBps - exp.feeBps);
+
+        if (spreadBps >= threshold) {
+          opportunities.push({
+            pair: cheap.pair || exp.pair,
+            cheapPool: { id: cheap.id, dex: cheap.dex, price: parseFloat(cheap.price.toPrecision(8)), feeBps: cheap.feeBps },
+            expensivePool: { id: exp.id, dex: exp.dex, price: parseFloat(exp.price.toPrecision(8)), feeBps: exp.feeBps },
+            spreadPct, spreadBps, estimatedProfitBps: profitBps,
+            detectedAt: new Date().toISOString(),
+          });
+        }
       }
     }
   }
 
-  // Sort by spread descending
   opportunities.sort((a, b) => b.spreadBps - a.spreadBps);
+  appendHistory({ type: "scan", timestamp: new Date().toISOString(), opportunities });
 
-  // Persist to history
-  appendHistory({
-    type: "scan",
-    timestamp: new Date().toISOString(),
-    opportunities,
-  });
+  const dexCounts: Record<string, number> = {};
+  for (const p of allPools) dexCounts[p.dex] = (dexCounts[p.dex] || 0) + 1;
 
   return {
-    ok: true,
-    command: "scan",
-    thresholdBps: threshold,
-    hodlmmPoolsScanned: hodlmmPools.length,
-    xykPoolsScanned: xykPools.length,
-    matchingPairs: new Set(
-      hodlmmPools
-        .map((p) => pairKey(p.tokenX, p.tokenY))
-        .filter((k) => xykByPair.has(k))
-    ).size,
+    ok: true, command: "scan", thresholdBps: threshold,
+    totalPoolsScanned: allPools.length,
+    dexDistribution: dexCounts,
+    pairsWithMultipleDexes,
     opportunitiesFound: opportunities.length,
-    opportunities,
+    opportunities: opportunities.slice(0, 20),
     scannedAt: new Date().toISOString(),
   };
 }
