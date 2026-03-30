@@ -4,7 +4,7 @@ description: "HODLMM pool yield scanner, position health monitor, and optimal en
 metadata:
   author: "nianchen1231-netizen"
   author-agent: "Atomic Tortoise"
-  user-invocable: "true"
+  user-invocable: "false"
   arguments: "doctor | status | run analyze | run position | run entry"
   entry: "hodlmm-yield-radar/hodlmm-yield-radar.ts"
   requires: "wallet"
@@ -15,207 +15,136 @@ metadata:
 
 ## What it does
 
-Scans all Bitflow HODLMM pools for real-time yield rates, monitors LP position health, and recommends optimal entry strategies for concentrated liquidity provision on Stacks L2. Aggregates fee APR, bin utilization, and reserve depth across pools to rank opportunities. Tracks existing positions for drift, out-of-range status, and estimated IL. Generates entry parameters (bin range, allocation split, price bounds) without submitting any transaction.
+Scans all Bitflow pools for real-time yield rates via the Ticker API, filters junk pools (APY > 1000%, liquidity < $10K), and ranks opportunities by risk-adjusted score. Monitors existing positions and generates entry parameters without submitting any transaction.
 
 ## Why agents need it
 
-Any AIBTC agent holding sBTC or STX needs to know which HODLMM pool offers the highest fee yield at the lowest current risk before committing capital. Without this skill, agents must query each pool independently and manually compare metrics. This skill centralizes that scan, ranks pools by risk-adjusted yield, and surfaces actionable entry parameters — enabling agents to make LP decisions confidently and without guesswork.
+Any AIBTC agent holding sBTC or STX needs to know which pool offers the highest fee yield at the lowest current risk before committing capital. This skill centralizes the scan, ranks pools by risk-adjusted yield (fee APY / spread volatility), and surfaces actionable entry parameters.
 
 ## Safety notes
 
 - All operations are read-only. No transaction is ever submitted to chain.
-- The `run entry` command generates recommended entry parameters (bin range, amounts, price bounds) as a JSON payload for the agent to review — it does not execute the transaction.
-- Wallet address is used only for position lookups. No signing is required and no keys are accessed.
-- Pool yield figures are point-in-time estimates based on recent fee data and current bin distribution. Past fee rates do not guarantee future yield.
+- The `run entry` command generates recommended parameters as JSON — it does not execute.
+- Wallet address is used only for position lookups. No signing or key access.
+- Yield figures are point-in-time estimates based on 24h volume × fee rate. Past volume does not guarantee future yield.
 
 ## Commands
 
 ### doctor
 
-Checks connectivity to the Bitflow API and verifies that HODLMM pool data is reachable. Safe to run anytime — read-only, no wallet required.
+Checks connectivity to the Bitflow API.
 
 ```bash
 bun run hodlmm-yield-radar/hodlmm-yield-radar.ts doctor
 ```
 
-Verifies:
-- Bitflow API endpoint is reachable
-- At least one HODLMM pool returns valid data
-- Wallet address (if configured) is a valid Stacks address format
-
 ### status
 
-Returns a live summary of all HODLMM pools: pool ID, active bin, fee tier, estimated 24h fee APR, total liquidity, and reserve imbalance ratio. Sorted by fee APR descending.
+Returns a live summary of all pools: pool ID, name, fee APY, liquidity, volume, and prices.
 
 ```bash
 bun run hodlmm-yield-radar/hodlmm-yield-radar.ts status
 ```
 
-Output:
-```json
-{
-  "status": "success",
-  "action": "Pool scan complete — 4 pools found",
-  "data": {
-    "pools": [
-      {
-        "poolId": "dlmm_3",
-        "tokenX": "sBTC",
-        "tokenY": "STX",
-        "feeTierBps": 30,
-        "activeBinId": 447,
-        "feeApr24h": 18.4,
-        "totalLiquidityUsd": 214000,
-        "reserveImbalanceRatio": 0.45
-      }
-    ],
-    "scanTimestamp": "2026-03-28T10:00:00.000Z"
-  },
-  "error": null
-}
-```
-
 ### run analyze
 
-Performs a deep yield analysis on a specific pool: fee APR over 1h/24h/7d windows, bin concentration, liquidity depth around the active bin, and a composite yield score (0–100).
+Ranks pools by risk-adjusted yield score and projects returns for a given capital amount.
 
 ```bash
-bun run hodlmm-yield-radar/hodlmm-yield-radar.ts run analyze --pool-id <pool_id>
-```
-
-Options:
-- `--pool-id` (required) — HODLMM pool identifier (e.g. `dlmm_3`)
-
-Output:
-```json
-{
-  "status": "success",
-  "action": "Analysis complete for dlmm_3",
-  "data": {
-    "poolId": "dlmm_3",
-    "tokenX": "sBTC",
-    "tokenY": "STX",
-    "feeApr": {
-      "1h": 21.2,
-      "24h": 18.4,
-      "7d": 14.7
-    },
-    "activeBinId": 447,
-    "binConcentrationScore": 72,
-    "liquidityDepthBins": 8,
-    "compositeYieldScore": 68,
-    "yieldLabel": "attractive",
-    "timestamp": "2026-03-28T10:00:00.000Z"
-  },
-  "error": null
-}
+bun run hodlmm-yield-radar/hodlmm-yield-radar.ts run analyze --amount <usd_value>
 ```
 
 ### run position
 
-Checks the health of an existing LP position for a given wallet address in a specific pool. Returns in-range status, drift distance from active bin, estimated IL, and a hold/rebalance/exit recommendation.
+Checks position status for a given wallet address.
 
 ```bash
-bun run hodlmm-yield-radar/hodlmm-yield-radar.ts run position --pool-id <pool_id> --address <stx_address>
-```
-
-Options:
-- `--pool-id` (required) — HODLMM pool identifier
-- `--address` (required) — Stacks address to check
-
-Output:
-```json
-{
-  "status": "success",
-  "action": "Position health check complete",
-  "data": {
-    "poolId": "dlmm_3",
-    "address": "SP2...",
-    "inRange": true,
-    "positionBins": 3,
-    "activeBinId": 447,
-    "nearestBinOffset": 1,
-    "avgBinOffset": 2.3,
-    "estimatedIlPct": 0.18,
-    "feeEarnedEstimate24hUsd": 4.2,
-    "recommendation": "hold",
-    "timestamp": "2026-03-28T10:00:00.000Z"
-  },
-  "error": null
-}
+bun run hodlmm-yield-radar/hodlmm-yield-radar.ts run position --address <stx_address>
 ```
 
 ### run entry
 
-Generates optimal entry parameters for a given pool and intended capital amount. Outputs recommended bin range, token allocation split, and price bounds — ready for the agent to pass to a transaction-executing skill. Does not submit any transaction.
+Generates optimal entry parameters for a given pool and capital amount.
 
 ```bash
-bun run hodlmm-yield-radar/hodlmm-yield-radar.ts run entry --pool-id <pool_id> --amount-usd <amount>
-```
-
-Options:
-- `--pool-id` (required) — HODLMM pool identifier
-- `--amount-usd` (required) — intended capital in USD equivalent (e.g. `500`)
-- `--strategy` (optional) — `tight` (default) | `wide` — bin range width strategy
-
-Output:
-```json
-{
-  "status": "success",
-  "action": "Entry parameters generated — review before executing",
-  "data": {
-    "poolId": "dlmm_3",
-    "strategy": "tight",
-    "activeBinId": 447,
-    "recommendedBinRange": { "lower": 444, "upper": 450 },
-    "tokenXAmountSats": 25000,
-    "tokenYAmountUstx": 1820000000,
-    "priceBounds": {
-      "lowerUsd": 84200,
-      "upperUsd": 86800
-    },
-    "estimatedFeeApr24h": 18.4,
-    "note": "Parameters only — no transaction submitted. Pass to a write skill to execute."
-  },
-  "error": null
-}
+bun run hodlmm-yield-radar/hodlmm-yield-radar.ts run entry --pool <pool_id> --amount <usd_value>
 ```
 
 ## Output contract
 
-All commands return a unified JSON envelope to stdout:
+All commands return a unified JSON envelope:
+
+### Success (status)
 
 ```json
 {
-  "status": "success | error | blocked",
-  "action": "human-readable summary of result or next step",
-  "data": {},
-  "error": null
+  "status": "success",
+  "action": "status",
+  "data": {
+    "pools": [
+      {
+        "pool_id": "SPQC38PW542EQJ5M11CR25P7BS1CA6QT4TBXR7CV.dlmm-stx-sbtc",
+        "name": "STX-sBTC",
+        "liquidity_usd": 214000,
+        "volume_24h": 18500,
+        "fee_apy_pct": 18.4,
+        "last_price": 0.00001234
+      }
+    ],
+    "protocol": { "name": "Bitflow", "tvl_usd": 5200000 },
+    "prices": { "stx_usd": 0.82, "btc_usd": 67500 },
+    "meta": { "total_tickers": 45, "filtered_pools": 8, "min_liquidity_filter_usd": 10000 },
+    "timestamp": "2026-03-28T10:00:00.000Z"
+  }
 }
 ```
 
-On error:
+### Success (analyze)
+
+```json
+{
+  "status": "success",
+  "action": "analyze",
+  "data": {
+    "amount_usd": 500,
+    "note": "APY estimated from 24h volume × 0.3% fee × 365 / liquidity.",
+    "recommendations": [
+      {
+        "rank": 1,
+        "pool_id": "SPQC38PW542EQJ5M11CR25P7BS1CA6QT4TBXR7CV.dlmm-stx-sbtc",
+        "name": "STX-sBTC",
+        "liquidity_usd": 214000,
+        "fee_apy_pct": 18.4,
+        "spread_volatility_pct": 2.1,
+        "risk_adjusted_score": 5.93,
+        "projected_yields": {
+          "amount_usd": 500,
+          "daily_usd": 0.25,
+          "weekly_usd": 1.76,
+          "monthly_usd": 7.67
+        }
+      }
+    ]
+  }
+}
+```
+
+### Error
+
 ```json
 {
   "status": "error",
-  "action": "Check Bitflow API connectivity and retry",
+  "action": "analyze",
   "data": {},
-  "error": "descriptive error message"
+  "error": "No qualifying pools after filtering (APY ≤ 1000%, liquidity ≥ $10k, volume > 0)."
 }
 ```
 
-`status` field routing:
-- `success` — data is valid, agent may proceed
-- `error` — something failed, surface to user
-- `blocked` — pre-condition not met (e.g. address has no position for `run position`)
-
 ## Known constraints
 
-- Requires Bitflow API connectivity. If the API is unreachable, all commands except `doctor` will return `error`.
-- HODLMM pool data may have up to 60 seconds of delay relative to on-chain state.
-- Fee APR estimates are computed from recent swap fee volume and may not reflect sudden pool activity changes.
-- `compositeYieldScore` weights: fee APR 24h (50%), bin concentration (30%), liquidity depth (20%).
-- `yieldLabel` thresholds: 0–30 = `low`, 31–60 = `moderate`, 61–80 = `attractive`, 81–100 = `high`.
-- `run entry` generates parameters for the tight strategy using ±3 bins around the active bin; wide strategy uses ±7 bins.
-- `run entry` does not simulate slippage or validate that sufficient token balances exist — pair with a pre-flight check in the executing skill.
-- Pools with fewer than 5 active bins of liquidity depth will return a `low` yield label regardless of fee APR.
+- Requires Bitflow Ticker API connectivity.
+- Queries the general Bitflow ticker endpoint, not HODLMM DLMM bin-level data directly.
+- Fee APY is computed as: 24h volume × 0.3% fee rate × 365 / pool liquidity.
+- Pools with APY > 1000%, liquidity < $10K, or zero 24h volume are filtered out.
+- Risk-adjusted score = fee APY / (spread volatility + 1).
+- `run entry` does not simulate slippage or validate token balances.
