@@ -84,16 +84,25 @@ All commands return a unified JSON envelope:
     "pools": [
       {
         "pool_id": "SPQC38PW542EQJ5M11CR25P7BS1CA6QT4TBXR7CV.dlmm-stx-sbtc",
-        "name": "STX-sBTC",
-        "liquidity_usd": 214000,
-        "volume_24h": 18500,
-        "fee_apy_pct": 18.4,
-        "last_price": 0.00001234
+        "name": "STX/SBTC",
+        "base_currency": "SP...",
+        "target_currency": "SP...",
+        "liquidity_usd": 214000.00,
+        "last_price": 0.000012,
+        "high": 0.000013,
+        "low": 0.000011,
+        "volume_24h": 18500.00,
+        "fee_apy_pct": 18.40
       }
     ],
-    "protocol": { "name": "Bitflow", "tvl_usd": 5200000 },
+    "protocol": { "name": "Bitflow", "tvl_usd": 5200000.00, "stacks_tvl_usd": 3200000.00 },
     "prices": { "stx_usd": 0.82, "btc_usd": 67500 },
-    "meta": { "total_tickers": 45, "filtered_pools": 8, "min_liquidity_filter_usd": 10000 },
+    "meta": {
+      "total_tickers": 45,
+      "filtered_pools": 8,
+      "min_liquidity_filter_usd": 1000,
+      "assumed_fee_rate_pct": 0.3
+    },
     "timestamp": "2026-03-28T10:00:00.000Z"
   }
 }
@@ -106,22 +115,25 @@ All commands return a unified JSON envelope:
   "status": "success",
   "action": "analyze",
   "data": {
-    "amount_usd": 500,
-    "note": "APY estimated from 24h volume × 0.3% fee × 365 / liquidity.",
+    "amount_usd": 500.00,
+    "note": "APY estimated from 24h volume × 0.3% fee × 365 / liquidity. Past volume is not guaranteed.",
     "recommendations": [
       {
         "rank": 1,
         "pool_id": "SPQC38PW542EQJ5M11CR25P7BS1CA6QT4TBXR7CV.dlmm-stx-sbtc",
-        "name": "STX-sBTC",
-        "liquidity_usd": 214000,
-        "fee_apy_pct": 18.4,
-        "spread_volatility_pct": 2.1,
-        "risk_adjusted_score": 5.93,
+        "name": "STX/SBTC",
+        "liquidity_usd": 214000.00,
+        "fee_apy_pct": 18.40,
+        "spread_volatility_pct": 2.10,
+        "risk_adjusted_score": 5.9300,
         "projected_yields": {
-          "amount_usd": 500,
+          "amount_usd": 500.00,
           "daily_usd": 0.25,
           "weekly_usd": 1.76,
-          "monthly_usd": 7.67
+          "monthly_usd": 7.67,
+          "daily_pct": 0.05,
+          "weekly_pct": 0.35,
+          "monthly_pct": 1.51
         }
       }
     ]
