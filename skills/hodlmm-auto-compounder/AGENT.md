@@ -1,7 +1,7 @@
 ---
-name: Atomic Tortoise
+name: hodlmm-auto-compounder-agent
 skill: hodlmm-auto-compounder
-description: "Autonomous compounder that harvests HODLMM LP fees and redeposits them at the active bin for compound yield growth."
+description: "Agent behavior rules for the HODLMM auto-compounder skill."
 ---
 
 ## Decision order

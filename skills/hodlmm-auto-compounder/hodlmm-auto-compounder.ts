@@ -296,8 +296,11 @@ async function cmdCompound(address: string, poolId: string, minSats: number, con
     return;
   }
 
-  // Pre-flight: verify Stacks API reachable
-  try { await fetchJson(`${STACKS_API}/v2/info`); } catch {
+  // Pre-flight: verify Stacks API reachable (longer timeout for write ops)
+  try {
+    const resp = await fetch(`${STACKS_API}/v2/info`, { signal: AbortSignal.timeout(20_000) });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  } catch {
     errOut("API_DOWN", "Stacks API unreachable — refusing to execute", "Run 'doctor' to diagnose");
     return;
   }
