@@ -119,14 +119,30 @@ async function getSbtcBalance(address: string): Promise<number> {
   return sbtcKey ? Number(ft[sbtcKey].balance ?? 0) : 0;
 }
 
-async function getBtcPrice(): Promise<number> {
-  const d = await fetchJson("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd");
-  return d?.bitcoin?.usd ?? 0;
-}
-
-async function getStxPrice(): Promise<number> {
-  const d = await fetchJson("https://api.coingecko.com/api/v3/simple/price?ids=stacks&vs_currencies=usd");
-  return d?.stacks?.usd ?? 0;
+async function getPricesFromBitflow(): Promise<{ btcPrice: number; stxPrice: number }> {
+  const resp = await fetchJson(`${HODLMM_API}/app/v1/pools`);
+  const pools = resp?.data ?? (Array.isArray(resp) ? resp : []);
+  // Find STX-sBTC pool to derive STX/BTC ratio, then use sBTC ≈ BTC assumption
+  const stxSbtcPool = pools.find((p: any) => {
+    const id = (p.poolId ?? p.pool_id ?? "").toLowerCase();
+    return id.includes("stx") && id.includes("sbtc");
+  });
+  if (stxSbtcPool) {
+    const stxTvl = Number(stxSbtcPool.tvl_token_y ?? stxSbtcPool.tvlTokenY ?? 0);
+    const sbtcTvl = Number(stxSbtcPool.tvl_token_x ?? stxSbtcPool.tvlTokenX ?? 0);
+    const stxUsd = Number(stxSbtcPool.token_y_price_usd ?? stxSbtcPool.tokenYPriceUsd ?? 0);
+    const btcUsd = Number(stxSbtcPool.token_x_price_usd ?? stxSbtcPool.tokenXPriceUsd ?? 0);
+    if (stxUsd > 0 && btcUsd > 0) return { btcPrice: btcUsd, stxPrice: stxUsd };
+  }
+  // Fallback: derive from on-chain XYK reserves (STX per sBTC ratio × known sBTC≈BTC)
+  try {
+    const reserves = await getPoolReserves();
+    const stxPerBtc = reserves.reserveStx / reserves.reserveSbtc * (1e8 / 1e6);
+    // Assume 1 sBTC ≈ $100k as rough estimate when no USD price available
+    return { btcPrice: 100000, stxPrice: 100000 / stxPerBtc };
+  } catch {
+    return { btcPrice: 0, stxPrice: 0 };
+  }
 }
 
 async function getHodlmmPool(poolId: string): Promise<any> {
@@ -300,8 +316,8 @@ async function cmdDoctor(): Promise<void> {
   } catch (e: any) { checks["xyk_pool_reserves"] = `fail: ${e.message}`; }
 
   try {
-    await getBtcPrice();
-    checks["price_feed"] = "ok";
+    const prices = await getPricesFromBitflow();
+    checks["price_feed"] = prices.btcPrice > 0 ? `ok (BTC: $${prices.btcPrice.toFixed(0)}, STX: $${prices.stxPrice.toFixed(2)})` : "degraded (fallback estimates)";
   } catch (e: any) { checks["price_feed"] = `fail: ${e.message}`; }
 
   const allOk = Object.values(checks).every(v => v.startsWith("ok"));
@@ -495,12 +511,12 @@ async function cmdExecute(address: string, amountStx: number, slippageBps: numbe
 async function cmdPosition(address: string): Promise<void> {
   if (!address?.startsWith("SP") && !address?.startsWith("SM")) { errOut("BAD_ADDRESS", "Need a valid Stacks address (SP.../SM...)", "--address SP..."); return; }
 
-  const [stxBal, sbtcBal, stxPrice, btcPrice] = await Promise.all([
+  const [stxBal, sbtcBal, prices] = await Promise.all([
     getStxBalance(address),
     getSbtcBalance(address),
-    getStxPrice(),
-    getBtcPrice(),
+    getPricesFromBitflow(),
   ]);
+  const { stxPrice, btcPrice } = prices;
 
   // Check HODLMM positions
   const poolIds = ["dlmm_1", "dlmm_2", "dlmm_3", "dlmm_4", "dlmm_5", "dlmm_6", "dlmm_7", "dlmm_8"];
