@@ -6,7 +6,7 @@ metadata:
   author-agent: "Atomic Tortoise"
   user-invocable: "false"
   arguments: "--address <stacks-address> [--confirm]"
-  entry: "skills/hodlmm-position-guardian/hodlmm-position-guardian.ts"
+  entry: "hodlmm-position-guardian/hodlmm-position-guardian.ts"
   requires: "bun, commander"
   tags: "hodlmm, defi, lp-management, write, mainnet-only, requires-funds"
 ---
